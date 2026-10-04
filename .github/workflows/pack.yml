@@ -1,0 +1,82 @@
+name: pack
+
+# Build-and-pack only: the test suite runs on Travis (.travis.yml).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MODULE_PATH: github.com/Masterminds/goutils
+      MODULE_VERSION: v1.1.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: false
+
+      # Pre-modules project (no go.mod): build in GOPATH mode under its
+      # canonical import path, as .travis.yml does.
+      - name: Build
+        env:
+          GO111MODULE: 'off'
+        run: |
+          export GOPATH="$RUNNER_TEMP/gopath"
+          mkdir -p "$GOPATH/src/$MODULE_PATH"
+          rsync -a --exclude=.git ./ "$GOPATH/src/$MODULE_PATH/"
+          cd "$GOPATH/src/$MODULE_PATH"
+          go build -v ./...
+
+      # Module zip via golang.org/x/mod/zip.CreateFromDir (proxy inclusion
+      # rules). The source copy omits .git and the seal-added .github/, which
+      # the public zip does not carry; the helper module lives outside it.
+      - name: Create module zip
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/modsrc"
+          HELPER="$RUNNER_TEMP/modzip"
+          OUT="$GITHUB_WORKSPACE/out"
+          mkdir -p "$SRC" "$HELPER" "$OUT"
+          rsync -a --exclude=.git --exclude=.github ./ "$SRC/"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: modzip <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/modzip
+          go get golang.org/x/mod@v0.17.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$SRC" "$OUT/$MODULE_VERSION.zip"
+          unzip -l "$OUT/$MODULE_VERSION.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: goutils-v1.1.0-module-zip
+          path: out/v1.1.0.zip
+          if-no-files-found: error
